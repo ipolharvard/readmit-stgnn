@@ -14,7 +14,6 @@ from data.readmission_utils import get_readmission_label_mimic
 from collections import Counter
 from sklearn.preprocessing import LabelEncoder
 
-
 COLS_IRRELEVANT = [
     "subject_id",
     "hadm_id",
@@ -24,7 +23,7 @@ COLS_IRRELEVANT = [
     "date",
     "node_name",
 ]
-CAT_COLUMNS = LAB_COLS + ["gender", "ethnicity"]
+CAT_COLUMNS = LAB_COLS + ["gender"]
 
 SUBGOUPRS_EXCLUDED = [
     "Z00-Z13",
@@ -46,7 +45,7 @@ SUBGOUPRS_EXCLUDED = [
 
 
 def ehr_bag_of_words_mimic(
-    df_demo, df_ehr, col_name, time_step_by="day", filter_freq=None
+        df_demo, df_ehr, col_name, time_step_by="day", filter_freq=None
 ):
     """
     Get EHR sequence using naive bag-of-words method
@@ -103,7 +102,6 @@ def ehr_bag_of_words_mimic(
             )  # both inclusive
         else:
             raise NotImplementedError
-        assert len(dt_range) > 1
 
         curr_ehr_df = df_ehr[df_ehr["hadm_id"] == admit_id]
 
@@ -113,7 +111,7 @@ def ehr_bag_of_words_mimic(
             if "charttime" in df_ehr.columns:
                 curr_day_ehrs = curr_ehr_df[
                     curr_ehr_df["Day_Number"] == float(day_num)
-                ][col_name]
+                    ][col_name]
             else:
                 # not time-varying, i.e., diagnoses ICD code
                 curr_day_ehrs = curr_ehr_df[col_name]
@@ -241,8 +239,8 @@ def lab_one_hot_mimic(df_demo, df_lab, col_name, time_step_by="day", filter_freq
                     df_lab_onehot[lab].append("nan")
                 else:
                     if (
-                        curr_day_lab.loc[curr_day_lab[col_name] == lab, "flag"]
-                        == "abnormal"
+                            curr_day_lab.loc[curr_day_lab[col_name] == lab, "flag"]
+                            == "abnormal"
                     ).any():
                         df_lab_onehot[lab].append("abnormal")
                     else:
@@ -270,7 +268,6 @@ def lab_one_hot_mimic(df_demo, df_lab, col_name, time_step_by="day", filter_freq
 
 
 def preproc_ehr_cat_embedding(X):
-
     train_indices = X[X["splits"] == "train"].index
     target = "target"
 
@@ -385,9 +382,9 @@ def ehr2sequence(preproc_dict, df_demo, by="day"):
     X_dict = {}
     for i in range(X.shape[0]):
         key = (
-            str(df.iloc[i]["subject_id"])
-            + "_"
-            + str(pd.to_datetime(df.iloc[i]["date"]).date())
+                str(df.iloc[i]["subject_id"])
+                + "_"
+                + str(pd.to_datetime(df.iloc[i]["date"]).date())
         )
         X_dict[key] = X[i]
 
@@ -504,8 +501,8 @@ def main(args):
 
         # save
         with open(
-            os.path.join(args.save_dir, "ehr_preprocessed_all_{}.pkl".format(format)),
-            "wb",
+                os.path.join(args.save_dir, "ehr_preprocessed_all_{}.pkl".format(format)),
+                "wb",
         ) as pf:
             pickle.dump(preproc_dict, pf)
         print(
@@ -524,10 +521,10 @@ def main(args):
         seq_dict["lab_cols"] = lab_cols
         seq_dict["med_cols"] = med_cols
         with open(
-            os.path.join(
-                args.save_dir, "ehr_preprocessed_seq_by_day_{}.pkl".format(format)
-            ),
-            "wb",
+                os.path.join(
+                    args.save_dir, "ehr_preprocessed_seq_by_day_{}.pkl".format(format)
+                ),
+                "wb",
         ) as pf:
             pickle.dump(seq_dict, pf)
 

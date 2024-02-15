@@ -1,4 +1,4 @@
-DEMO_COLS = ["age", "gender", "ethnicity"]
+DEMO_COLS = ["age", "gender"]
 
 
 LAB_COLS = [

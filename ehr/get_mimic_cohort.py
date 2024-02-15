@@ -1,15 +1,17 @@
+import argparse
+import os
+import sys
+
 import numpy as np
 import pandas as pd
-import os
-from tqdm import tqdm
-import pickle
-import argparse
-import sys
+from pandarallel import pandarallel
 from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+tqdm.pandas()
 
 sys.path.append("../")
 from constants import LAB_COLS
-
 
 ADMISSION_TYPES_EXCLUDED = [
     "AMBULATORY OBSERVATION",
@@ -26,7 +28,6 @@ VIEW_POSITIONS_INCLUDED = ["PA", "AP"]
 
 
 def find_icd_group(df_icd, code):
-    group = ""
     letter = code[0]
     number = code[1:].split(".")[0]
     if number.isnumeric():
@@ -34,11 +35,11 @@ def find_icd_group(df_icd, code):
         icd_sel = df_icd.loc[df_icd.SUBGROUP.str.startswith(letter)].copy()
         icd_sel = icd_sel.loc[
             (icd_sel.START_IDX.str.isnumeric()) & (icd_sel.END_IDX.str.isnumeric())
-        ].copy()
+            ].copy()
         icd_sel = icd_sel.loc[
             (icd_sel.START_IDX.astype(float) <= number)
             & (icd_sel.END_IDX.astype(float) >= number)
-        ].copy()
+            ].copy()
         if len(icd_sel) > 0:
             group = icd_sel.at[icd_sel.index[0], "SUBGROUP"]
         else:
@@ -48,12 +49,12 @@ def find_icd_group(df_icd, code):
         icd_sel = icd_sel.loc[
             (icd_sel.START_IDX.str.isnumeric() == False)
             & (icd_sel.END_IDX.str.isnumeric() == False)
-        ].copy()
+            ].copy()
         numheader = number[:-1]
         icd_sel = icd_sel.loc[
             (icd_sel.START_IDX.str.startswith(numheader))
             & (icd_sel.END_IDX.str.startswith(numheader))
-        ].copy()
+            ].copy()
         if len(icd_sel) > 0:
             group = icd_sel.at[icd_sel.index[0], "SUBGROUP"]
         else:
@@ -62,214 +63,37 @@ def find_icd_group(df_icd, code):
 
 
 def main(args):
-    MIMIC_CORE_DIR = os.path.join(args.raw_data_dir, "core")
+    pandarallel.initialize(progress_bar=True, nb_workers=20)
+
     MIMIC_HOSP_DIR = os.path.join(args.raw_data_dir, "hosp")
 
-    df_admission = pd.read_csv(os.path.join(MIMIC_CORE_DIR, "admissions.csv.gz"))
-    df_admission_orig = df_admission.copy()
-
-    ## cxr metadata
-    df_cxr = pd.read_csv(
-        os.path.join(args.cxr_data_dir, "mimic-cxr-2.0.0-metadata.csv.gz")
-    )
-
-    ## Get CXRs for all admissions
-    print("Matching CXRs for admissions...")
-    df_admission_w_cxr = {}
-    for col in df_admission.columns:
-        df_admission_w_cxr[col] = []
-    for col in df_cxr.columns:
-        df_admission_w_cxr[col] = []
-
-    for _, row in tqdm(df_admission.iterrows(), total=len(df_admission)):
-        subject_id = row["subject_id"]
-        admit_id = row["hadm_id"]
-        admit_time = pd.to_datetime(row["admittime"])
-        discharge_time = pd.to_datetime(row["dischtime"])
-
-        curr_cxr = df_cxr[df_cxr["subject_id"] == subject_id]
-
-        for _, row_cxr in curr_cxr.iterrows():
-            study_date = pd.to_datetime(row_cxr["StudyDate"], format="%Y%m%d")
-            # filter out cxrs not within current hospitalization
-            if (study_date < admit_time) or (study_date > discharge_time):
-                continue
-            for col in df_admission.columns:
-                df_admission_w_cxr[col].append(row[col])
-            for col in df_cxr.columns:
-                if col in df_admission.columns:
-                    continue
-                df_admission_w_cxr[col].append(row_cxr[col])
-
-    df_admission_w_cxr = pd.DataFrame.from_dict(df_admission_w_cxr)
-    df_admission_w_cxr.to_csv(
-        os.path.join(args.save_dir, "admission_original_w_cxr.csv"), index=False
-    )
-
-    ### Filter out <48hr, certain discharge locations
-    print(
-        "Filtering out admissions <48hr and certain admission types and discharge locations..."
-    )
-    row_idxs = []
-    for i_row, row in tqdm(
-        df_admission_w_cxr.iterrows(), total=len(df_admission_w_cxr)
-    ):
-        hosp_stay = pd.to_datetime(row["dischtime"]) - pd.to_datetime(row["admittime"])
-        admit_type = row["admission_type"]
-        discharge_loc = row["discharge_location"]
-        admissioin_loc = row["admission_location"]
-        if admit_type in ADMISSION_TYPES_EXCLUDED:
-            continue
-        if discharge_loc in DISCHARGE_LOCATION_EXCLUDED:
-            continue
-        if isinstance(discharge_loc, float) and np.isnan(discharge_loc):
-            continue
-        if hosp_stay.days < 2:
-            continue
-
-        row_idxs.append(i_row)
-    df_admission_w_cxr = df_admission_w_cxr.iloc[np.array(row_idxs)].copy(deep=True)
-    df_admission_w_cxr = df_admission_w_cxr.reset_index(drop=True)
-    df_admission_w_cxr.to_csv(
-        os.path.join(args.save_dir, "admission_48hr_discharge_filtered.csv"),
-        index=False,
-    )
-
-    ### Filter out non-AP and non-PA views
-    print("Filtering out CXR views that are not AP or PA...")
-    row_idxs = []
-    for i_row, row in tqdm(
-        df_admission_w_cxr.iterrows(), total=len(df_admission_w_cxr)
-    ):
-        view = row["ViewPosition"]
-        if view != "AP" and view != "PA":
-            continue
-        row_idxs.append(i_row)
-
-    df_admit_48hr_cxr_filtered = df_admission_w_cxr.iloc[np.array(row_idxs)].copy(
-        deep=True
-    )
-
-    df_admit_48hr_cxr_filtered = df_admit_48hr_cxr_filtered.reset_index(drop=True)
-    assert len(df_admit_48hr_cxr_filtered["ViewPosition"].unique()) == 2
-
-    ### Keep admissions with >=2 cxrs
-    print("Finding admissions with at least 2 CXRs...")
-    idxs_to_include = []
-    for i_row, row in tqdm(
-        df_admit_48hr_cxr_filtered.iterrows(), total=len(df_admit_48hr_cxr_filtered)
-    ):
-        curr_admit_df = df_admit_48hr_cxr_filtered[
-            df_admit_48hr_cxr_filtered["hadm_id"] == row["hadm_id"]
-        ]
-        study_ids = curr_admit_df["study_id"].unique()
-        if len(study_ids) >= 2:
-            idxs_to_include.append(i_row)
-    df_admit_48hr_cxr_filtered = df_admit_48hr_cxr_filtered.iloc[
-        np.array(idxs_to_include)
-    ].copy(deep=True)
-    df_admit_48hr_cxr_filtered = df_admit_48hr_cxr_filtered.reset_index(drop=True)
-
-    ## Find absolute paths of cxrs
-    print("Matching CXR file paths...")
-    df_cxr_split = pd.read_csv(
-        os.path.join(args.cxr_data_dir, "mimic-cxr-2.0.0-split.csv.gz")
-    )
-    dicom2fullpath = {}
-
-    cxr_paths = []
-    for _, row in tqdm(
-        df_admit_48hr_cxr_filtered.iterrows(), total=len(df_admit_48hr_cxr_filtered)
-    ):
-        dicom_id = row["dicom_id"]
-        study_id = df_cxr_split[df_cxr_split["dicom_id"] == dicom_id][
-            "study_id"
-        ].values[0]
-        subject_id = row["subject_id"]
-
-        subdir = "p" + str(subject_id)[:2]
-        path = os.path.join(
-            args.cxr_data_dir,
-            "files",
-            subdir,
-            "p" + str(subject_id),
-            "s" + str(study_id),
-            dicom_id + ".jpg",
-        )
-        # assert os.path.exists(path)
-        cxr_paths.append(path)
-        dicom2fullpath[dicom_id] = path
-
-    df_admit_48hr_cxr_filtered["image_path"] = cxr_paths
-    df_admit_48hr_cxr_filtered.to_csv(
-        os.path.join(args.save_dir, "admission_48hr_discharge_cxr_filtered.csv"),
-        index=False,
-    )
+    df_patients = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "patients.csv.gz"),
+                              parse_dates=["anchor_year", "dod"])
+    df_patients.dod += pd.Timedelta(hours=23, minutes=59)
+    df_admission = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "admissions.csv.gz"),
+                               parse_dates=["admittime", "dischtime", "deathtime"])
 
     ### Get readmission info
     print("Getting readmission information...")
-    readmission_gap_in_days = []
-    readmission_id = []
-    readmitted_within_30 = []
-    for _, row in tqdm(
-        df_admit_48hr_cxr_filtered.iterrows(), total=len(df_admit_48hr_cxr_filtered)
-    ):
-        subject_id = row["subject_id"]
-        admit_id = row["hadm_id"]
-        admit_time = pd.to_datetime(row["admittime"])
-        discharge_time = pd.to_datetime(row["dischtime"])
 
-        pat_admissions = df_admission_orig[
-            df_admission_orig["subject_id"] == subject_id
-        ]
+    def process_readmission_info(_df: pd.DataFrame):
+        df = _df.sort_values(by="admittime")
+        admit_times = pd.Series(df.admittime[1:].tolist() + [df.dod.iloc[0]], index=df.index)
+        readmit_df = (admit_times - df.dischtime.values).dt.days.to_frame("readmission_gap_in_days")
+        readmit_df.loc[readmit_df.readmission_gap_in_days < 0] = 0
+        readmit_df["readmitted_within_30days"] = readmit_df.readmission_gap_in_days < 30
+        hadm_ids = pd.Series(df.hadm_id[1:].tolist() + [np.nan], index=df.index)
+        readmit_df["readmission_id"] = hadm_ids.where(readmit_df.readmitted_within_30days)
+        return readmit_df
 
-        pat_admissions = df_admit_48hr_cxr_filtered[
-            df_admit_48hr_cxr_filtered["subject_id"] == subject_id
-        ]
+    df_gb = df_admission.merge(df_patients[["subject_id", "dod"]], on="subject_id").groupby(
+        "subject_id", group_keys=False)
+    readmission_info_df = df_gb.parallel_apply(process_readmission_info)
+    df_admission = df_admission.join(readmission_info_df)
+    # drop admissions where a patient died
+    df_admission = df_admission.loc[df_admission.deathtime.isna()]
 
-        # sort current patient's all admissions by admittime
-        pat_admissions = pat_admissions.sort_values(by=["admittime"], ascending=True)
-        readmit_gap = None
-        readmit_id = None
-        for _, curr_row in pat_admissions.iterrows():
-            if curr_row["admission_type"] in ADMISSION_TYPES_EXCLUDED:
-                continue
-
-            curr_admit_time = pd.to_datetime(curr_row["admittime"])
-            curr_discharge_time = pd.to_datetime(curr_row["dischtime"])
-            if (curr_discharge_time - curr_admit_time).days < 2:
-                continue
-            if pd.to_datetime(curr_row["admittime"]) > discharge_time:
-                readmit_gap = (
-                    pd.to_datetime(curr_row["admittime"]) - discharge_time
-                ).days
-                readmit_id = int(curr_row["hadm_id"])
-                break
-
-        if readmit_gap is None:
-            readmission_gap_in_days.append(np.nan)
-            readmission_id.append(np.nan)
-
-            if not (
-                isinstance(row["deathtime"], float) and np.isnan(row["deathtime"])
-            ):  # died within hospital, treat as readmitted
-                readmitted_within_30.append("True")
-            elif row["discharge_location"] == "DIED":
-                readmitted_within_30.append("True")
-            else:
-                readmitted_within_30.append("False")
-        else:
-            readmission_gap_in_days.append(readmit_gap)
-            readmission_id.append(readmit_id)
-            if readmit_gap <= 30:
-                readmitted_within_30.append("True")
-            else:
-                readmitted_within_30.append("False")
-
-    df_admit_48hr_cxr_filtered["readmission_gap_in_days"] = readmission_gap_in_days
-    df_admit_48hr_cxr_filtered["readmission_id"] = readmission_id
-    df_admit_48hr_cxr_filtered["readmitted_within_30days"] = readmitted_within_30
-    df_admit_48hr_cxr_filtered.to_csv(
+    df_admission.to_csv(
         os.path.join(
             args.save_dir, "admission_48hr_discharge_cxr_filtered_labeled.csv"
         ),
@@ -277,51 +101,30 @@ def main(args):
     )
 
     ### Split patients into train/val/test
-    all_patients = list(set(df_admit_48hr_cxr_filtered["subject_id"].tolist()))
-    train_val_patients, test_patients = train_test_split(
-        all_patients, test_size=0.2, random_state=12
-    )
+    test_patients = pd.read_csv("../data/mimic_our_test_cohort.csv").subject_id
+    train_val_patients = list(set(df_admission["subject_id"]).difference(test_patients))
     train_patients, val_patients = train_test_split(
-        train_val_patients, test_size=0.2, random_state=12
+        train_val_patients, test_size=0.1, random_state=12
     )
-    df_train = df_admit_48hr_cxr_filtered[
-        df_admit_48hr_cxr_filtered["subject_id"].isin(train_patients)
-    ][["hadm_id", "readmitted_within_30days"]].drop_duplicates()
-    df_val = df_admit_48hr_cxr_filtered[
-        df_admit_48hr_cxr_filtered["subject_id"].isin(val_patients)
-    ][["hadm_id", "readmitted_within_30days"]].drop_duplicates()
-    df_test = df_admit_48hr_cxr_filtered[
-        df_admit_48hr_cxr_filtered["subject_id"].isin(test_patients)
-    ][["hadm_id", "readmitted_within_30days"]].drop_duplicates()
-    print(
-        "Train pos ratio:",
-        (df_train["readmitted_within_30days"] == "True").sum() / len(df_train),
-    )
-    print(
-        "Val pos ratio:",
-        (df_val["readmitted_within_30days"] == "True").sum() / len(df_val),
-    )
-    print(
-        "Test pos ratio:",
-        (df_test["readmitted_within_30days"] == "True").sum() / len(df_test),
-    )
+    df_train = df_admission[df_admission["subject_id"].isin(train_patients)]
+    df_val = df_admission[df_admission["subject_id"].isin(val_patients)]
+    df_test = df_admission[df_admission["subject_id"].isin(test_patients)]
 
-    splits = []
-    for _, row in tqdm(
-        df_admit_48hr_cxr_filtered.iterrows(), total=len(df_admit_48hr_cxr_filtered)
-    ):
-        subject_id = row["subject_id"]
-        if subject_id in train_patients:
-            splits.append("train")
-        elif subject_id in val_patients:
-            splits.append("val")
-        elif subject_id in test_patients:
-            splits.append("test")
+    print("Train pos ratio:", df_train["readmitted_within_30days"].sum() / len(df_train))
+    print("Val pos ratio:", df_val["readmitted_within_30days"].sum() / len(df_val))
+    print("Test pos ratio:", df_test["readmitted_within_30days"].sum() / len(df_test))
+
+    def assign_split(id):
+        if id in train_patients:
+            return "train"
+        elif id in val_patients:
+            return "val"
         else:
-            raise ValueError
-    df_admit_48hr_cxr_filtered["splits"] = splits
+            return "test"
 
-    df_admit_48hr_cxr_filtered.to_csv(
+    df_admission["splits"] = df_admission["subject_id"].parallel_apply(assign_split)
+
+    df_admission.to_csv(
         os.path.join(
             args.save_dir, "admission_48hr_discharge_cxr_filtered_w_splits.csv"
         ),
@@ -329,266 +132,122 @@ def main(args):
     )
 
     ### Get demographics
-    df_patients = pd.read_csv(os.path.join(MIMIC_CORE_DIR, "patients.csv.gz"))
+    print("Getting age, gender, splits...")
 
-    print("Getting age, gender, ethnicity, splits...")
-    ages = []
-    genders = []
-    ethnicity = []
-    for _, row in tqdm(
-        df_admit_48hr_cxr_filtered.iterrows(), total=len(df_admit_48hr_cxr_filtered)
-    ):
-        subject_id = row["subject_id"]
-        admit_id = row["hadm_id"]
-        admit_time = pd.to_datetime(row["admittime"])
+    df_patients.set_index("subject_id", inplace=True)
 
-        age_anchor = df_patients[df_patients["subject_id"] == subject_id][
-            "anchor_age"
-        ].values[0]
-        anchor_yr = df_patients[df_patients["subject_id"] == subject_id][
-            "anchor_year"
-        ].values[0]
+    df_patients["year_of_birth"] = df_patients.anchor_year.dt.year - df_patients.anchor_age
 
-        gender = df_patients[df_patients["subject_id"] == subject_id]["gender"].values[
-            0
-        ]
+    df_admission["gender"] = df_admission.subject_id.map(df_patients.gender)
+    df_admission["age"] = df_admission.admittime.dt.year - df_patients.loc[
+        df_admission.subject_id].year_of_birth.values
 
-        eth = df_admission[df_admission["subject_id"] == subject_id][
-            "ethnicity"
-        ].values[0]
-
-        age_at_admit = (int(admit_time.year) - int(anchor_yr)) + int(age_anchor)
-
-        ages.append(age_at_admit)
-        genders.append(gender)
-        ethnicity.append(eth)
-
-    df_admit_48hr_cxr_filtered["age"] = ages
-    df_admit_48hr_cxr_filtered["gender"] = genders
-    df_admit_48hr_cxr_filtered["ethnicity"] = ethnicity
-    df_admit_48hr_cxr_filtered.loc[
-        df_admit_48hr_cxr_filtered["ethnicity"] == "UNABLE TO OBTAIN", "ethnicity"
-    ] = "UNKNOWN"
-
-    df_admit_48hr_cxr_filtered.to_csv(
+    df_admission.to_csv(
         os.path.join(args.save_dir, "mimic_admission_demo.csv"), index=False
     )
     print("Admission basic information saved...")
 
-    df_admission_list = (
-        df_admit_48hr_cxr_filtered[["hadm_id", "subject_id"]].copy().drop_duplicates()
-    )
-
     ### Medication
-    df_presb = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "prescriptions.csv.gz"))
-    df_presb.head()
+    df_prescriptions = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "prescriptions.csv.gz"),
+                                   parse_dates=["starttime"], low_memory=False)
 
-    df_presb_filtered = df_presb[
-        df_presb["subject_id"].isin(df_admit_48hr_cxr_filtered["subject_id"].tolist())
-    ]
-    df_presb_filtered = df_presb_filtered[
-        df_presb_filtered["hadm_id"].isin(df_admission_list["hadm_id"].tolist())
-    ]
+    df_prescriptions = df_prescriptions.loc[df_prescriptions.hadm_id.isin(df_admission.hadm_id)]
+    df_prescriptions = df_prescriptions.loc[df_prescriptions.starttime.notnull()].copy()
 
     ## Map NDC to therapeutic classes
-    df_med_map = pd.read_csv("../data/ndc2therapeutic.csv")
+    df_med_map = pd.read_csv("../data/ndc2therapeutic.csv").dropna()
+    df_med_map = df_med_map.groupby(
+        "NDC_MEDICATION_CODE").MED_THERAPEUTIC_CLASS_DESCRIPTION.first().to_dict()
 
-    idxs_to_include = []
-    med_classes = []
-    df_presb_filtered = df_presb_filtered.reset_index(drop=True)
     print("Mapping NDC to therapeutic classes...")
-    for i_row, row in tqdm(df_presb_filtered.iterrows(), total=len(df_presb_filtered)):
-        ndc = row["ndc"]
-        starttime = row["starttime"]
-        if isinstance(starttime, float) and np.isnan(starttime):
-            continue
-        med_class = df_med_map[df_med_map["NDC_MEDICATION_CODE"] == ndc][
-            "MED_THERAPEUTIC_CLASS_DESCRIPTION"
-        ]
-        if len(med_class) > 0:
-            # assert len(med_class) == 1
-            med_class = list(set(med_class.values))
-            med_class = [c for c in med_class if isinstance(c, str)]
-            # print(med_class)
-            if len(med_class) > 1:
-                print(med_class)
-            if len(med_class) == 0:  # only nan
-                continue
-            idxs_to_include.append(i_row)
-            med_classes.append(med_class[0])
+    df_prescriptions["MED_THERAPEUTIC_CLASS_DESCRIPTION"] = df_prescriptions.ndc.map(
+        df_med_map)
+    df_prescriptions.dropna(subset=["MED_THERAPEUTIC_CLASS_DESCRIPTION"], inplace=True)
 
-    df_presb_filtered_mapped = df_presb_filtered.iloc[np.array(idxs_to_include)].copy(
-        deep=True
-    )
-    df_presb_filtered_mapped = df_presb_filtered_mapped.reset_index(drop=True)
-    df_presb_filtered_mapped["MED_THERAPEUTIC_CLASS_DESCRIPTION"] = med_classes
+    df_day_num = df_prescriptions[["subject_id", "hadm_id", "starttime"]].merge(
+        df_admission[["hadm_id", "admittime", "dischtime"]], on="hadm_id", validate="m:1")
+    day_num = (df_day_num.starttime - df_day_num.admittime).dt.days + 1
+    day_num.where(df_day_num.starttime > df_day_num.admittime, inplace=True)
+    day_num.where(df_day_num.starttime < df_day_num.dischtime, inplace=True)
 
-    ## Add day number
-    med_day_numbers = []
-    for _, row in tqdm(
-        df_presb_filtered_mapped.iterrows(), total=len(df_presb_filtered_mapped)
-    ):
-        if isinstance(starttime, float) and np.isnan(starttime):
-            continue
-        starttime = pd.to_datetime(row["starttime"])
+    df_prescriptions["Day_Number"] = day_num.values
+    df_prescriptions.dropna(subset=["Day_Number"], inplace=True)
 
-        admit_id = row["hadm_id"]
-        subject_id = row["subject_id"]
-
-        admittime = pd.to_datetime(
-            df_admit_48hr_cxr_filtered[
-                df_admit_48hr_cxr_filtered["hadm_id"] == admit_id
-            ]["admittime"].values[0]
-        )
-        dischargetime = pd.to_datetime(
-            df_admit_48hr_cxr_filtered[
-                df_admit_48hr_cxr_filtered["hadm_id"] == admit_id
-            ]["dischtime"].values[0]
-        )
-
-        if starttime > dischargetime or starttime < admittime:
-            med_day_numbers.append(np.nan)
-            continue
-
-        day_num = (starttime.date() - admittime.date()).days + 1
-        med_day_numbers.append(day_num)
-
-    df_presb_filtered_mapped["Day_Number"] = med_day_numbers
-    df_presb_filtered_mapped = df_presb_filtered_mapped[
-        ~df_presb_filtered_mapped["Day_Number"].isnull()
-    ]
-
-    df_presb_filtered_mapped.to_csv(
+    df_prescriptions.to_csv(
         os.path.join(args.save_dir, "mimic_hosp_med_filtered.csv"), index=False
     )
 
     ### ICD-10
     df_diag = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "diagnoses_icd.csv.gz"))
-
-    df_diag_table = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "d_icd_procedures.csv.gz"))
+    df_diag = df_diag.loc[df_diag.icd_version == 10].drop("icd_version", axis=1)
+    df_diag = df_diag[df_diag.hadm_id.isin(df_admission.hadm_id)]
+    df_diag.icd_code = df_diag.icd_code.str.replace(".", "").str[:3]
 
     df_icd = pd.read_csv("../data/ICD10_Groups.csv")
+    # convert df_icd to a reasonable mapping
+    icd2group = {
+        (letter, f"{i:02}"): subgroup
+        for letter, start_idx, end_idx, subgroup
+        in df_icd[["LETTER", "START_IDX", "END_IDX", "SUBGROUP"]].itertuples(index=False)
+        if start_idx.isnumeric() and end_idx.isnumeric()
+        for i in range(int(start_idx), int(end_idx) + 1)
+    }
+    ## add problematic mappings
+    icd2group.update(
+        {
+            (letter, start_idx): subgroup
+            for letter, start_idx, end_idx, subgroup
+            in df_icd[["LETTER", "START_IDX", "END_IDX", "SUBGROUP"]].itertuples(index=False)
+            if not (start_idx.isnumeric() and end_idx.isnumeric())
 
-    df_diag_subgroup = {k: [] for k in df_diag.columns}
-    df_diag_subgroup["SUBGROUP"] = []
+        }
+    )
+    icd2group[("O", "98")] = "O94-O9A"
+    icd2group[("O", "99")] = "O94-O9A"
+    icd2group[("O", "9A")] = "O94-O9A"
 
     print("Mapping ICD-10 code to subgroups...")
-    for _, row in tqdm(df_admission_list.iterrows(), total=len(df_admission_list)):
-        subject_id = row["subject_id"]
-        admit_id = row["hadm_id"]
 
-        curr_diag = df_diag[df_diag["subject_id"] == subject_id]
-        curr_diag = curr_diag[curr_diag["hadm_id"] == admit_id]
-
-        for _, diag_row in curr_diag.iterrows():
-            code = str(diag_row["icd_code"])
-            version = int(diag_row["icd_version"])
-            if version != 10:
-                continue
-            subgroup = find_icd_group(df_icd, code)
-
-            if subgroup == "" or subgroup == "UNKNOWN":
-                continue
-            else:
-                df_diag_subgroup["SUBGROUP"].append(subgroup)
-                for col in df_diag.columns:
-                    df_diag_subgroup[col].append(diag_row[col])
-
-    df_diag_subgroup = pd.DataFrame.from_dict(df_diag_subgroup)
-    df_diag_subgroup.to_csv(
+    df_diag["SUBGROUP"] = df_diag.icd_code.progress_apply(
+        lambda icd: icd2group.get((icd[0], icd[1:]), np.nan)
+    )
+    df_diag.dropna(subset=["SUBGROUP"], inplace=True)
+    df_diag.to_csv(
         os.path.join(args.save_dir, "mimic_hosp_icd_subgroups.csv"), index=False
     )
 
     ### Get labs
     df_lab_item = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "d_labitems.csv.gz"))
-    lab_item_idxs = []
-    for i_row, row in df_lab_item.iterrows():
-        label = row["label"]
-        if isinstance(label, str) and label != " ":
-            fluid = row["fluid"]
-            if (str(label) + " " + str(fluid)) in LAB_COLS:
-                lab_item_idxs.append(i_row)
-
-    df_lab_item_filtered = df_lab_item.iloc[np.array(lab_item_idxs)].copy(deep=True)
-    df_lab_item_filtered = df_lab_item_filtered.reset_index(drop=True)
+    df_lab_item["label_fluid"] = df_lab_item.label + " " + df_lab_item.fluid
+    mask_lab_that_we_consider = df_lab_item.label_fluid.isin(LAB_COLS)
+    df_lab_item_filtered = df_lab_item.loc[mask_lab_that_we_consider]
 
     ## labevents file is big, process using chunks
     print("Reading lab events...")
-    df_lab_filtered = []
-    with pd.read_csv(
-        os.path.join(MIMIC_HOSP_DIR, "labevents.csv.gz"), chunksize=1000
-    ) as reader:
-        for chunk in reader:
-            chunk = chunk[
-                chunk["hadm_id"].isin(df_admit_48hr_cxr_filtered["hadm_id"].tolist())
-            ]
-            chunk = chunk[chunk["itemid"].isin(df_lab_item_filtered["itemid"].tolist())]
-            df_lab_filtered.append(chunk)
-
-    df_lab_filtered = pd.concat(df_lab_filtered)
+    df_lab_filtered = pd.read_csv(os.path.join(MIMIC_HOSP_DIR, "labevents.csv.gz"),
+                                  parse_dates=["charttime"])
+    df_lab_filtered = df_lab_filtered[df_lab_filtered.hadm_id.isin(df_admission.hadm_id)]
+    df_lab_filtered = df_lab_filtered.merge(df_lab_item_filtered, on="itemid", how="inner")
 
     ## Add lab name by label + fluids, and day number
-    label_fluids = []
-    categories = []
-    day_numbers = []
     print("Getting lab information...")
-    for _, row in tqdm(df_lab_filtered.iterrows(), total=len(df_lab_filtered)):
-        itemid = row["itemid"]
-        admit_id = row["hadm_id"]
+    df_day_num = df_lab_filtered[["hadm_id", "charttime"]].merge(
+        df_admission[["hadm_id", "admittime", "dischtime"]], on="hadm_id")
+    day_num = (df_day_num.charttime - df_day_num.admittime).dt.days + 1
+    day_num.where(df_day_num.charttime > df_day_num.admittime, inplace=True)
+    day_num.where(df_day_num.charttime < df_day_num.dischtime, inplace=True)
 
-        label = df_lab_item_filtered[df_lab_item_filtered["itemid"] == itemid][
-            "label"
-        ].values[0]
-        fluid = df_lab_item_filtered[df_lab_item_filtered["itemid"] == itemid][
-            "fluid"
-        ].values[0]
-        cat = df_lab_item_filtered[df_lab_item_filtered["itemid"] == itemid][
-            "category"
-        ].values[0]
-        label_fluids.append(str(label) + " " + str(fluid))
-        categories.append(cat)
-
-        # day number
-        charttime = pd.to_datetime(row["charttime"])
-        admittime = pd.to_datetime(
-            df_admit_48hr_cxr_filtered[
-                df_admit_48hr_cxr_filtered["hadm_id"] == admit_id
-            ]["admittime"].values[0]
-        )
-        dischargetime = pd.to_datetime(
-            df_admit_48hr_cxr_filtered[
-                df_admit_48hr_cxr_filtered["hadm_id"] == admit_id
-            ]["dischtime"].values[0]
-        )
-
-        if charttime > dischargetime or charttime < admittime:
-            day_numbers.append(np.nan)
-            continue
-
-        day_num = (charttime.date() - admittime.date()).days + 1  # starts from 1
-        day_numbers.append(day_num)
-
-    df_lab_filtered["label_fluid"] = label_fluids
-    df_lab_filtered["category"] = categories
-    df_lab_filtered["Day_Number"] = day_numbers
-
-    df_lab_filtered = df_lab_filtered[~df_lab_filtered["Day_Number"].isnull()]
-
+    df_lab_filtered["Day_Number"] = day_num.values
+    df_lab_filtered.dropna(subset=["Day_Number"], inplace=True)
     df_lab_filtered.to_csv(
         os.path.join(args.save_dir, "mimic_hosp_lab_filtered.csv"), index=False
     )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Filtering admission info from MIMIC-IV."
-    )
-
+    parser = argparse.ArgumentParser(description="Filtering admission info from MIMIC-IV.")
     parser.add_argument(
         "--raw_data_dir", type=str, help="Dir to downloaded MIMIC-IV data."
-    )
-    parser.add_argument(
-        "--cxr_data_dir", type=str, help="Dir to downloaded MIMIC-CXR-JPG data."
     )
     parser.add_argument(
         "--save_dir", type=str, help="Dir to save filtered cohort files."
