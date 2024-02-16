@@ -24,42 +24,6 @@ DISCHARGE_LOCATION_EXCLUDED = [
     # "SKILLED NURSING FACILITY",
     "AGAINST ADVICE",
 ]
-VIEW_POSITIONS_INCLUDED = ["PA", "AP"]
-
-
-def find_icd_group(df_icd, code):
-    letter = code[0]
-    number = code[1:].split(".")[0]
-    if number.isnumeric():
-        number = float(number)
-        icd_sel = df_icd.loc[df_icd.SUBGROUP.str.startswith(letter)].copy()
-        icd_sel = icd_sel.loc[
-            (icd_sel.START_IDX.str.isnumeric()) & (icd_sel.END_IDX.str.isnumeric())
-            ].copy()
-        icd_sel = icd_sel.loc[
-            (icd_sel.START_IDX.astype(float) <= number)
-            & (icd_sel.END_IDX.astype(float) >= number)
-            ].copy()
-        if len(icd_sel) > 0:
-            group = icd_sel.at[icd_sel.index[0], "SUBGROUP"]
-        else:
-            group = "UNKNOWN"
-    else:
-        icd_sel = df_icd.loc[df_icd.SUBGROUP.str.startswith(letter)].copy()
-        icd_sel = icd_sel.loc[
-            (icd_sel.START_IDX.str.isnumeric() == False)
-            & (icd_sel.END_IDX.str.isnumeric() == False)
-            ].copy()
-        numheader = number[:-1]
-        icd_sel = icd_sel.loc[
-            (icd_sel.START_IDX.str.startswith(numheader))
-            & (icd_sel.END_IDX.str.startswith(numheader))
-            ].copy()
-        if len(icd_sel) > 0:
-            group = icd_sel.at[icd_sel.index[0], "SUBGROUP"]
-        else:
-            group = "UNKNOWN"
-    return group
 
 
 def main(args):
@@ -192,19 +156,18 @@ def main(args):
         if start_idx.isnumeric() and end_idx.isnumeric()
         for i in range(int(start_idx), int(end_idx) + 1)
     }
-    ## add problematic mappings
+    ## add problematic mappings manually
     icd2group.update(
         {
-            (letter, start_idx): subgroup
-            for letter, start_idx, end_idx, subgroup
-            in df_icd[["LETTER", "START_IDX", "END_IDX", "SUBGROUP"]].itertuples(index=False)
-            if not (start_idx.isnumeric() and end_idx.isnumeric())
-
+            ("C", "7A"): "C7A-C7A",
+            ("C", "7B"): "C7B-C7B",
+            ("D", "3A"): "D3A-D3A",
+            ("O", "94"): "O94-O9A",
+            ("O", "98"): "O94-O9A",
+            ("O", "99"): "O94-O9A",
+            ("O", "9A"): "O94-O9A",
         }
     )
-    icd2group[("O", "98")] = "O94-O9A"
-    icd2group[("O", "99")] = "O94-O9A"
-    icd2group[("O", "9A")] = "O94-O9A"
 
     print("Mapping ICD-10 code to subgroups...")
 

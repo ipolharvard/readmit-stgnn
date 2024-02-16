@@ -1,18 +1,17 @@
-import pandas as pd
-import numpy as np
+import argparse
+import copy
 import os
 import pickle
-import copy
-import argparse
-from tqdm import tqdm
 import sys
+
+import numpy as np
+import pandas as pd
+from pandarallel import pandarallel
+from sklearn.preprocessing import LabelEncoder
+from tqdm import tqdm
 
 sys.path.append("../")
 from constants import DEMO_COLS, LAB_COLS
-from data.readmission_utils import get_readmission_label_mimic
-
-from collections import Counter
-from sklearn.preprocessing import LabelEncoder
 
 COLS_IRRELEVANT = [
     "subject_id",
@@ -22,6 +21,7 @@ COLS_IRRELEVANT = [
     "splits",
     "date",
     "node_name",
+    "target"
 ]
 CAT_COLUMNS = LAB_COLS + ["gender"]
 
@@ -44,235 +44,7 @@ SUBGOUPRS_EXCLUDED = [
 ]
 
 
-def ehr_bag_of_words_mimic(
-        df_demo, df_ehr, col_name, time_step_by="day", filter_freq=None
-):
-    """
-    Get EHR sequence using naive bag-of-words method
-    Args:
-        df_demo: demographics dataframe
-        df_ehr: CPT/ICD dataframe
-        ehr_type: 'cpt' or 'icd'
-        time_step_by: 'day', what is the time step size?
-    Returns:
-        ehr_seq_padded: shape (num_admissions, max_seq_len, num_ehr_subgroups),
-            short sequences are padded with -1
-    """
-
-    all_values = list(set(df_ehr[col_name]))
-    all_values = [
-        val
-        for val in all_values
-        if isinstance(val, str) and (val not in SUBGOUPRS_EXCLUDED)
-    ]
-
-    df_ehr_count = {
-        "subject_id": [],
-        "hadm_id": [],
-        "admittime": [],
-        "dischtime": [],
-        "date": [],
-        "target": [],
-        "node_name": [],
-        "splits": [],
-    }
-    initial_cols = len(df_ehr_count) + len(DEMO_COLS)
-    # add demographic columns
-    for demo in DEMO_COLS:
-        df_ehr_count[demo] = []
-
-    # add subgroup columns
-    for subgrp in all_values:
-        df_ehr_count[subgrp] = []
-
-    for _, row in tqdm(df_demo.iterrows(), total=len(df_demo)):
-        pat = row["subject_id"]
-        admit_id = row["hadm_id"]
-        admit_dt = row["admittime"]
-        discharge_dt = row["dischtime"]
-        label = row["readmitted_within_30days"]
-
-        if (str(pat) + "_" + str(admit_id)) in df_ehr_count["node_name"]:
-            continue
-
-        if time_step_by == "day":
-            dt_range = pd.date_range(
-                start=pd.to_datetime(admit_dt).date(),
-                end=pd.to_datetime(discharge_dt).date(),
-            )  # both inclusive
-        else:
-            raise NotImplementedError
-
-        curr_ehr_df = df_ehr[df_ehr["hadm_id"] == admit_id]
-
-        for dt in dt_range:
-            day_num = (dt.date() - pd.to_datetime(admit_dt).date()).days + 1
-
-            if "charttime" in df_ehr.columns:
-                curr_day_ehrs = curr_ehr_df[
-                    curr_ehr_df["Day_Number"] == float(day_num)
-                    ][col_name]
-            else:
-                # not time-varying, i.e., diagnoses ICD code
-                curr_day_ehrs = curr_ehr_df[col_name]
-
-            df_ehr_count["subject_id"].append(pat)
-            df_ehr_count["hadm_id"].append(admit_id)
-            df_ehr_count["admittime"].append(admit_dt)
-            df_ehr_count["dischtime"].append(discharge_dt)
-            df_ehr_count["date"].append(str(dt))
-            df_ehr_count["target"].append(label)
-            df_ehr_count["splits"].append(row["splits"])
-            df_ehr_count["node_name"].append(str(pat) + "_" + str(admit_id))
-
-            for demo in DEMO_COLS:
-                if (demo in CAT_COLUMNS) and isinstance(row[demo], float):  # nan
-                    df_ehr_count[demo].append("UNKNOWN")
-                else:
-                    df_ehr_count[demo].append(row[demo])
-
-            if len(curr_day_ehrs) > 0:
-                ehr_counts = Counter(curr_day_ehrs)
-                for subgrp in all_values:
-                    if subgrp in ehr_counts.keys():
-                        df_ehr_count[subgrp].append(ehr_counts[subgrp])
-                    else:
-                        df_ehr_count[subgrp].append(0)
-            else:
-                for subgrp in all_values:
-                    df_ehr_count[subgrp].append(0)
-
-    df_ehr_count = pd.DataFrame.from_dict(df_ehr_count)
-
-    # drop zero occurrence subgroups
-    if filter_freq is not None:
-        freq = df_ehr_count[all_values].sum(axis=0)
-        drop_col_idxs = freq.values < filter_freq
-        df_ehr_count = df_ehr_count.drop(columns=freq.loc[drop_col_idxs].index)
-    else:
-        freq = df_ehr_count[all_values].sum(axis=0)
-        drop_col_idxs = freq.values == 0
-        df_ehr_count = df_ehr_count.drop(columns=freq.loc[drop_col_idxs].index)
-
-    print("Final subgroups:", len(df_ehr_count.columns) - initial_cols)
-
-    return df_ehr_count
-
-
-def lab_one_hot_mimic(df_demo, df_lab, col_name, time_step_by="day", filter_freq=None):
-    """
-    Get EHR sequence using naive bag-of-words method
-    Args:
-        df_demo: demographics dataframe
-        df_ehr: CPT/ICD dataframe
-        ehr_type: 'cpt' or 'icd'
-        time_step_by: 'day', what is the time step size?
-    Returns:
-        ehr_seq_padded: shape (num_admissions, max_seq_len, num_ehr_subgroups),
-            short sequences are padded with -1
-    """
-
-    lab_cols = list(set(df_lab[col_name]))
-    lab_cols = [col for col in lab_cols if isinstance(col, str)]
-
-    df_lab_onehot = {
-        "subject_id": [],
-        "hadm_id": [],
-        "admittime": [],
-        "dischtime": [],
-        "date": [],
-        "target": [],
-        "node_name": [],
-        "splits": [],
-    }
-    initial_cols = len(df_lab_onehot) + len(DEMO_COLS)
-    # add demographic columns
-    for demo in DEMO_COLS:
-        df_lab_onehot[demo] = []
-
-    # add subgroup columns
-    for col in lab_cols:
-        df_lab_onehot[col] = []
-
-    for _, row in tqdm(df_demo.iterrows(), total=len(df_demo)):
-        pat = row["subject_id"]
-        admit_id = row["hadm_id"]
-        admit_dt = row["admittime"]
-        discharge_dt = row["dischtime"]
-        label = row["readmitted_within_30days"]
-
-        if (str(pat) + "_" + str(admit_id)) in df_lab_onehot["node_name"]:
-            continue
-
-        if time_step_by == "day":
-            dt_range = pd.date_range(
-                start=pd.to_datetime(admit_dt).date(),
-                end=pd.to_datetime(discharge_dt).date(),
-            )  # both inclusive
-        else:
-            raise NotImplementedError
-        assert len(dt_range) > 1
-
-        curr_ehr_df = df_lab[df_lab["hadm_id"] == admit_id]
-
-        for dt in dt_range:
-            day_num = (dt.date() - pd.to_datetime(admit_dt).date()).days + 1
-            curr_day_lab = curr_ehr_df[curr_ehr_df["Day_Number"] == float(day_num)]
-
-            df_lab_onehot["subject_id"].append(pat)
-            df_lab_onehot["hadm_id"].append(admit_id)
-            df_lab_onehot["admittime"].append(admit_dt)
-            df_lab_onehot["dischtime"].append(discharge_dt)
-            df_lab_onehot["date"].append(str(dt))
-            df_lab_onehot["target"].append(label)
-            df_lab_onehot["splits"].append(row["splits"])
-            df_lab_onehot["node_name"].append(str(pat) + "_" + str(admit_id))
-
-            for demo in DEMO_COLS:
-                if (demo in CAT_COLUMNS) and isinstance(row[demo], float):  # nan
-                    df_lab_onehot[demo].append("UNKNOWN")
-                else:
-                    df_lab_onehot[demo].append(row[demo])
-
-            for lab in lab_cols:
-                if len(curr_day_lab) == 0:
-                    df_lab_onehot[lab].append("nan")
-                else:
-                    if (
-                            curr_day_lab.loc[curr_day_lab[col_name] == lab, "flag"]
-                            == "abnormal"
-                    ).any():
-                        df_lab_onehot[lab].append("abnormal")
-                    else:
-                        df_lab_onehot[lab].append("nan")
-
-    df_lab_onehot = pd.DataFrame.from_dict(df_lab_onehot)
-
-    # drop zero abnormal subgroups
-    if filter_freq is not None:
-        freq = (df_lab_onehot[lab_cols] == "abnormal").sum(
-            axis=0
-        )  # number of abnormals
-        drop_col_idxs = freq.values < filter_freq
-        df_lab_onehot = df_lab_onehot.drop(columns=freq.loc[drop_col_idxs].index)
-    else:
-        freq = (df_lab_onehot[lab_cols] == "abnormal").sum(
-            axis=0
-        )  # number of abnormals
-        drop_col_idxs = freq.values == 0
-        df_lab_onehot = df_lab_onehot.drop(columns=freq.loc[drop_col_idxs].index)
-
-    print("Final labs:", len(df_lab_onehot.columns) - initial_cols)
-
-    return df_lab_onehot
-
-
 def preproc_ehr_cat_embedding(X):
-    train_indices = X[X["splits"] == "train"].index
-    target = "target"
-
-    types = X.dtypes
-
     # encode categorical variables
     categorical_columns = []
     categorical_dims = {}
@@ -281,27 +53,14 @@ def preproc_ehr_cat_embedding(X):
             continue
         if col in CAT_COLUMNS:
             l_enc = LabelEncoder()
-            X[col] = X[col].fillna("VV_likely")
-            X[col] = X[col].replace(
-                {0.23990602999011235: "UNKNOWN"}
-            )  # TODO: confirm if removing this works
             print(col, X[col].unique())
             X[col] = l_enc.fit_transform(X[col].values)
             categorical_columns.append(col)
             categorical_dims[col] = len(l_enc.classes_)
-        else:
-            print(col)
-            X.fillna(X.loc[train_indices, col].mean(), inplace=True)
 
-    feature_cols = [
-        col for col in X.columns if (col != target) and (col not in COLS_IRRELEVANT)
-    ]
+    feature_cols = [col for col in X.columns if col not in COLS_IRRELEVANT]
     cat_idxs = [i for i, f in enumerate(feature_cols) if f in categorical_columns]
-    cat_dims = [
-        categorical_dims[f]
-        for i, f in enumerate(feature_cols)
-        if f in categorical_columns
-    ]
+    cat_dims = [categorical_dims[f] for i, f in enumerate(feature_cols) if f in categorical_columns]
 
     return {
         "X": X,
@@ -347,11 +106,7 @@ def preproc_ehr(X):
     X_enc = pd.concat(X_enc, axis=1)
     assert num_cols == X_enc.shape[-1]
 
-    feature_cols = [
-        col
-        for col in X_enc.columns
-        if (col != "target") and (col not in COLS_IRRELEVANT)
-    ]
+    feature_cols = [col for col in X_enc.columns if  (col not in COLS_IRRELEVANT)]
     cat_idxs = [i for i, f in enumerate(feature_cols) if f in categorical_columns]
     cat_dims = [
         categorical_dims[f]
@@ -377,49 +132,8 @@ def ehr2sequence(preproc_dict, df_demo, by="day"):
     feature_cols = preproc_dict["feature_cols"]
 
     print("Rearranging to sequences by {}...".format(by))
-    X = X[feature_cols].values
 
-    X_dict = {}
-    for i in range(X.shape[0]):
-        key = (
-                str(df.iloc[i]["subject_id"])
-                + "_"
-                + str(pd.to_datetime(df.iloc[i]["date"]).date())
-        )
-        X_dict[key] = X[i]
-
-    _, node_included_files, _, _, _, _ = get_readmission_label_mimic(
-        df_demo, max_seq_len=None
-    )
-
-    # arrange X by day or by cxr
-    feat_dict = {}
-    for node_name, _ in tqdm(node_included_files.items()):
-        # print(node_name)
-        ehr_row = df[df["node_name"] == node_name]
-        curr_admit = ehr_row["admittime"].values[0]
-        curr_discharge = ehr_row["dischtime"].values[0]
-        curr_pat = ehr_row["subject_id"].values[0]
-
-        if by == "day":
-            dt_range = pd.date_range(
-                start=pd.to_datetime(curr_admit).date(),
-                end=pd.to_datetime(curr_discharge).date(),
-            )
-        else:
-            raise NotImplementedError
-
-        curr_features = []
-        for dt in dt_range:
-            if by == "cxr":
-                key = str(curr_pat) + "_" + str(dt)
-            else:
-                key = str(curr_pat) + "_" + str(dt.date())
-            feat = X_dict[key]
-            curr_features.append(feat)
-
-        curr_features = np.stack(curr_features)  # (num_days, feature_dim)
-        feat_dict[node_name] = curr_features
+    feat_dict = {key: group.values for key, group in X.groupby("node_name")[feature_cols]}
 
     if "cat_idxs" in preproc_dict:
         cat_idxs = preproc_dict["cat_idxs"]
@@ -434,42 +148,67 @@ def ehr2sequence(preproc_dict, df_demo, by="day"):
         return {"feat_dict": feat_dict, "feature_cols": feature_cols}
 
 
+def date_ranges_to_days(row):
+    dt_range = pd.date_range(start=row.admittime.date(), end=row.dischtime.date())
+    return list(enumerate(dt_range, 1))
+
+
 def main(args):
+    pandarallel.initialize(progress_bar=True, nb_workers=20)
     # read csv files
     df_demo = pd.read_csv(
-        args.demo_file, dtype={k: str for k in CAT_COLUMNS}, low_memory=False
+        args.demo_file, dtype={k: str for k in CAT_COLUMNS}, low_memory=False,
+        parse_dates=["admittime", "dischtime"]
+
     )
-    df_lab = pd.read_csv(args.lab_file, dtype={"flag": str}, low_memory=False)
+
+    # TODO, remove this, for debugging only!
+    # df_demo = df_demo.iloc[:300].copy()
+
+    df_demo.rename(columns={"readmitted_within_30days": "target"}, inplace=True)
+    df_demo["node_name"] = df_demo["subject_id"].astype(str) + "_" + df_demo["hadm_id"].astype(str)
+    df_demo = df_demo.loc[:, df_demo.columns.isin(COLS_IRRELEVANT)]
+
+    days_series = df_demo[["admittime", "dischtime"]].apply(date_ranges_to_days, axis=1).explode()
+    days_df = pd.DataFrame(days_series.tolist(), columns=["Day_Number", "date"],
+                           index=days_series.index)
+    df_demo = df_demo.join(days_df, how="right")
+
+    # # icd
     df_icd = pd.read_csv(args.icd_file, low_memory=False)
-    df_med = pd.read_csv(args.med_file, low_memory=False)
-
-    # # TODO, remove this, for debugging only!
-    # df_demo = df_demo.iloc[:1000].copy()
-
-    # icd
-    df_icd_count = ehr_bag_of_words_mimic(
-        df_demo, df_icd, col_name="SUBGROUP", time_step_by="day", filter_freq=None
+    df_icd_count = (
+        df_icd.groupby("hadm_id").SUBGROUP
+        .value_counts()
+        .unstack("SUBGROUP")
     )
+    df_icd_count = df_icd_count.loc[:, ~df_icd_count.columns.isin(SUBGOUPRS_EXCLUDED)]
+    print("Finished processing ICD, rows:", len(df_icd_count))
 
     # lab
-    df_lab_onehot = lab_one_hot_mimic(
-        df_demo, df_lab, col_name="label_fluid", time_step_by="day", filter_freq=None
-    )
+    df_lab = pd.read_csv(args.lab_file, dtype={"flag": str}, low_memory=False)
+    df_lab = df_lab.loc[df_lab.label_fluid.isin(LAB_COLS)]
+    df_lab_onehot = (
+        df_lab.groupby(["hadm_id", "Day_Number"])
+        .parallel_apply(lambda _df: _df.groupby("label_fluid").flag.apply(lambda s: (s == "abnormal").any()))
+    ).unstack("label_fluid").reset_index()
+    print("Finished processing lab, rows:", len(df_lab_onehot))
 
     # medication
-    df_med_count = ehr_bag_of_words_mimic(
-        df_demo,
-        df_med,
-        col_name="MED_THERAPEUTIC_CLASS_DESCRIPTION",
-        time_step_by="day",
-        filter_freq=None,
-    )
+    df_med = pd.read_csv(args.med_file, low_memory=False)
+    df_med_count = (
+        df_med.groupby(["hadm_id", "Day_Number"]).MED_THERAPEUTIC_CLASS_DESCRIPTION
+        .value_counts()
+        .unstack("MED_THERAPEUTIC_CLASS_DESCRIPTION")
+    ).reset_index()
+    print("Finished processing medication, rows:", len(df_med_count))
 
     # combine
-    df_combined = pd.concat([df_icd_count, df_lab_onehot, df_med_count], axis=1)
-
-    # drop duplicated columns
-    df_combined = df_combined.loc[:, ~df_combined.columns.duplicated()]
+    df_combined = (
+        df_demo
+        .merge(df_icd_count, on="hadm_id", validate="m:1", how="left")
+        .merge(df_lab_onehot, on=["hadm_id", "Day_Number"], validate="1:1", how="left")
+        .merge(df_med_count, on=["hadm_id", "Day_Number"], validate="1:1", how="left")
+    ).fillna(0)
     df_combined.to_csv(os.path.join(args.save_dir, "ehr_combined.csv"), index=False)
 
     for format in ["cat_embedding", "one_hot"]:
