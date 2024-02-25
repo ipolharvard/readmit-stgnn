@@ -1,41 +1,33 @@
-import numpy as np
+import json
 import os
 import pickle
-import torch
-import json
-from argparse import Namespace
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import pandas as pd
-import math
-import utils
-import dgl
-from dgl.data.utils import load_graphs
-from args import get_args
-from collections import OrderedDict, defaultdict
 from json import dumps
-from tqdm import tqdm
+
+import dgl
+import torch
+import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+import utils
+from args import get_args
 from data.dataset import ReadmissionDataset
-from model.model import GraphRNN
-from model.fusion import JointFusionModel
-from dotted_dict import DottedDict
+from model.model import GraphRNN, GConvLayers
+from model.simple_rnn import SimpleRNN
 
 
 def evaluate(
-    args,
-    model,
-    graph,
-    features,
-    labels,
-    nid,
-    loss_fn,
-    best_thresh=0.5,
-    save_file=None,
-    thresh_search=False,
-    img_features=None,
-    ehr_features=None,
+        args,
+        model,
+        graph,
+        features,
+        labels,
+        nid,
+        loss_fn,
+        best_thresh=0.5,
+        save_file=None,
+        thresh_search=False,
+        img_features=None,
+        ehr_features=None,
 ):
     model.eval()
     with torch.no_grad():
@@ -85,7 +77,6 @@ def evaluate(
 
 
 def main(args):
-
     args.cuda = torch.cuda.is_available()
     device = "cuda" if args.cuda else "cpu"
 
@@ -112,31 +103,19 @@ def main(args):
         edge_ehr_file=args.edge_ehr_file,
         ehr_feature_file=args.ehr_feature_file,
         edge_modality=args.edge_modality,
-        feature_type=args.feature_type,
-        img_feature_dir=args.img_feature_dir,
         top_perc=args.edge_top_perc,
         gauss_kernel=args.use_gauss_kernel,
-        max_seq_len_img=args.max_seq_len_img,
         max_seq_len_ehr=args.max_seq_len_ehr,
-        sim_measure=args.sim_measure,
         standardize=True,
         ehr_types=args.ehr_types,
+        is_graph=args.model_name != "rnn",
     )
     g = dataset[0]
     cat_idxs = dataset.cat_idxs
     cat_dims = dataset.cat_dims
 
-    if args.feature_type != "multimodal":
-        features = g.ndata[
-            "feat"
-        ]  # features for each graph are the same, including temporal info
-        img_features = None
-        ehr_features = None
-    else:
-        img_features = g.ndata["img_feat"]
-        ehr_features = g.ndata["ehr_feat"]
-        features = None
-    labels = g.ndata["label"]  # labels are the same
+    features = g.ndata["feat"]
+    labels = g.ndata["label"]
     train_mask = g.ndata["train_mask"]
     val_mask = g.ndata["val_mask"]
     test_mask = g.ndata["test_mask"]
@@ -162,40 +141,25 @@ def main(args):
     val_nid = torch.nonzero(val_mask).squeeze().to(device)
     test_nid = torch.nonzero(test_mask).squeeze().to(device)
 
-    train_labels = labels[train_nid]
-    val_labels = labels[val_nid]
-    test_labels = labels[test_nid]
-
     logger.info(
-        "#Train samples: {}; positive percentage :{:.2f}".format(
-            train_mask.int().sum().item(),
-            (train_labels == 1).sum().item() / len(train_labels) * 100,
+        "#Train samples: {:,}; positive percentage: {:.2%}".format(
+            train_mask.sum(), labels[train_mask].float().mean()
         )
     )
     logger.info(
-        "#Val samples: {}; positive percentage :{:.2f}".format(
-            val_mask.int().sum().item(),
-            (val_labels == 1).sum().item() / len(val_labels) * 100,
+        "#Val samples: {:,}; positive percentage: {:.2%}".format(
+            val_mask.sum(), labels[val_mask].float().mean()
         )
     )
     logger.info(
-        "#Test samples: {}; positive percentage :{:.2f}".format(
-            test_mask.int().sum().item(),
-            (test_labels == 1).sum().item() / len(test_labels) * 100,
+        "#Test samples: {:,}; positive percentage: {:.2%}".format(
+            test_mask.sum(), labels[test_mask].float().mean(),
         )
     )
 
-    if args.cuda:
-        if args.feature_type != "multimodal":
-            features = features.to(device)
-        else:
-            img_features = img_features.to(device)
-            ehr_features = ehr_features.to(device)
-        labels = labels.to(device)
-        train_mask = train_mask.to(device)
-        val_mask = val_mask.to(device)
-        test_mask = test_mask.to(device)
-        g = g.int().to(device)
+    features = features.to(device)
+    labels = labels.to(device).float()
+    g = g.int().to(device)
 
     if args.model_name == "stgnn":
         in_dim = features.shape[-1]
@@ -213,25 +177,16 @@ def main(args):
             **config
         )
 
-    elif args.model_name == "joint_fusion":
-        img_config = utils.get_config("stgnn", args)
-        ehr_config = utils.get_config("stgnn", args)
-        img_in_dim = img_features.shape[-1]
-        ehr_in_dim = ehr_features.shape[-1]
-        model = JointFusionModel(
-            img_in_dim=img_in_dim,
-            ehr_in_dim=ehr_in_dim,
-            img_config=img_config,
-            ehr_config=ehr_config,
-            cat_idxs=cat_idxs,
-            cat_dims=cat_dims,
-            ehr_encoder_name=args.ehr_encoder_name,
-            cat_emb_dim=args.cat_emb_dim,
-            joint_hidden=args.joint_hidden,
-            num_classes=args.num_classes,
-            dropout=args.dropout,
-            device=device,
+    elif args.model_name == "rnn":
+        in_dim = features.shape[-1]
+        print("Input dim:", in_dim)
+        model = SimpleRNN(
+            input_size=in_dim,
+            hidden_size=args.hidden_dim,
+            output_size=1,
+            num_layers=args.num_rnn_layers
         )
+
     else:
         in_dim = features.shape[-1]
         print("Input dim:", in_dim)
@@ -245,6 +200,8 @@ def main(args):
         )
 
     model.to(device)
+    print("Compiling model...")
+    model = torch.compile(model)
 
     # define optimizer
     optimizer = torch.optim.Adam(
@@ -278,9 +235,6 @@ def main(args):
     logger.info("Using cosine annealing scheduler...")
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
-    # average meter for validation loss
-    nll_meter = utils.AverageMeter()
-
     if args.do_train:
         # Train
         logger.info("Training...")
@@ -295,19 +249,12 @@ def main(args):
             epoch += 1
             logger.info("Starting epoch {}...".format(epoch))
 
-            # forward
-            # if no temporal dim
-            if "fusion" in args.model_name:
-                logits = model(g, img_features, ehr_features)
-            elif args.model_name != "stgnn":
-                assert len(g) == 1
-                features_avg = features[:, -1, :]
-                logits, _ = model(g, features_avg)
+            if args.model_name == "rnn":
+                logits = model(features)
             else:
                 logits, _ = model(g, features)
 
-            if logits.shape[-1] == 1:
-                logits = logits.view(-1)
+            logits = logits.squeeze()
             loss = loss_fn(logits[train_nid], labels[train_nid])
 
             optimizer.zero_grad()
@@ -325,8 +272,6 @@ def main(args):
                     labels=labels,
                     nid=val_nid,
                     loss_fn=loss_fn,
-                    img_features=img_features,
-                    ehr_features=ehr_features,
                 )
                 model.train()
                 saver.save(epoch, model, optimizer, eval_results[args.metric_name])
@@ -366,8 +311,6 @@ def main(args):
         loss_fn=loss_fn,
         save_file=os.path.join(args.save_dir, "val_predictions.pkl"),
         thresh_search=args.thresh_search,
-        img_features=img_features,
-        ehr_features=ehr_features,
     )
     val_results_str = ", ".join(
         "{}: {:.4f}".format(k, v) for k, v in val_results.items()
@@ -385,8 +328,6 @@ def main(args):
         loss_fn=loss_fn,
         save_file=os.path.join(args.save_dir, "test_predictions.pkl"),
         best_thresh=val_results["best_thresh"],
-        img_features=img_features,
-        ehr_features=ehr_features,
     )
     test_results_str = ", ".join(
         "{}: {:.4f}".format(k, v) for k, v in test_results.items()

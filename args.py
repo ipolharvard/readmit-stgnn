@@ -127,6 +127,7 @@ def get_args():
             "stgnn",
             "graphsage",
             "joint_fusion",
+            "rnn"
         ),
         help="Name of the model.",
     )

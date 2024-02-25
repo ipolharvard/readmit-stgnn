@@ -1,13 +1,41 @@
-import numpy as np
-import pandas as pd
 import os
-import sys
-from tqdm import tqdm
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.metrics.pairwise import euclidean_distances, cosine_similarity
 import pickle
+import bisect
+from itertools import chain, islice
+
+import numpy as np
+from joblib import Parallel, delayed, Memory
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MinMaxScaler
+from sortedcontainers import SortedList
+from tqdm import tqdm
+
+memory = Memory(location=".", verbose=0)
 
 
+def balanced_splits(n, k):
+    total_comparisons = n * (n + 1) // 2
+    target_per_split = total_comparisons // k
+
+    splits = []
+    current_start = 0
+    while current_start < n:
+        current_end = current_start + 1
+        while current_end <= n and ((current_end - current_start) * (
+                n - current_start - (current_end - current_start) / 2)) < target_per_split:
+            current_end += 1
+
+        splits.append((current_start, min(current_end, n)))
+        current_start = current_end
+
+        remaining_splits = k - len(splits)
+        if remaining_splits > 0:
+            completed_comparisons = sum((e - s) * (n - s - (e - s) / 2) for s, e in splits)
+            target_per_split = (total_comparisons - completed_comparisons) // remaining_splits
+    return splits
+
+
+@memory.cache(ignore=["demo_dict"])
 def compute_dist_mat(demo_dict, scale=False):
     """
     Args:
@@ -28,20 +56,44 @@ def compute_dist_mat(demo_dict, scale=False):
         scaler.fit(demo_arr)
         demo_arr = scaler.transform(demo_arr)
 
-    distances = euclidean_distances(X=demo_arr, Y=demo_arr)
-
-    dist_dict = {"From": [], "To": [], "Distance": [], "Mask": []}
     node_names = list(demo_dict.keys())
-    for idx_node1 in tqdm(range(len(node_names))):
-        for idx_node2 in range(idx_node1, len(node_names)):
-            node1 = node_names[idx_node1]
-            node2 = node_names[idx_node2]
 
-            dist_dict["From"].append(node1)
-            dist_dict["To"].append(node2)
-            dist_dict["Distance"].append(distances[idx_node1, idx_node2])
+    print(f"This many to go: {len(node_names) * (len(node_names) + 1) // 2:,}")
+    n_jobs = 1
+    # splits = balanced_splits(len(node_names), n_jobs)
+    splits = balanced_splits(100, n_jobs)
 
-    return dist_dict
+    def worker(start_idx, stop_idx, i):
+        total = stop_idx - start_idx
+        total *= (len(node_names) - start_idx + 1) // 2
+
+        idx_generator = tqdm((
+            (idx_node1, idx_node2)
+            for idx_node1 in range(start_idx, stop_idx)
+            for idx_node2 in range(idx_node1, 100)
+        ), position=i, disable=i >= 10, total=total)
+        max_len = int(0.01 * total)
+        results = SortedList(key=lambda x: x[2])
+        while True:
+            for idx_node1, idx_node2 in islice(idx_generator, max_len):
+                results.add(
+                    (
+                        np.int32(idx_node1),
+                        np.int32(idx_node2),
+                        np.float32(np.linalg.norm(demo_arr[idx_node1] - demo_arr[idx_node2]))
+                    )
+                )
+            if len(results) < max_len:
+                break
+            del results[slice(-1, max_len - 1, -1)]
+        return results
+
+    result = Parallel(n_jobs=n_jobs, verbose=1000)(
+        delayed(worker)(start_idx, stop_idx, i) for i, (start_idx, stop_idx) in
+        enumerate(splits))
+
+    src_nodes, dst_nodes, dist = list(zip(*chain.from_iterable(result)))
+    return {"From": src_nodes, "To": dst_nodes, "Distance": dist}
 
 
 def compute_cos_sim_mat(demo_dict, scale=False):
@@ -82,16 +134,16 @@ def compute_cos_sim_mat(demo_dict, scale=False):
 
 
 def get_feat_seq(
-    node_included_files,
-    feature_dict,
-    max_seq_len,
-    pad_front=False,
-    time_deltas=None,
-    padding_val=None,
+        node_names,
+        feature_dict,
+        max_seq_len,
+        pad_front=False,
+        time_deltas=None,
+        padding_val=None,
 ):
     """
     Args:
-        node_included_files: dict, key is node name, value is list of imaging files
+        node_names: dict, key is node name, value is list of imaging files
         feature_dict: dict, key is node name, value is imaging/EHR feature vector
         max_seq_len: int, maximum sequence length
         pad_front: if True, will pad to the front with the first timestep, else pad to the end with the last timestep
@@ -101,15 +153,13 @@ def get_feat_seq(
         padded_features: numpy array, shape (sample_size, max_seq_len, feature_dim)
         seq_len: original sequence length without any padding
     """
-    seq_lengths = []
     padded_features = []
     padded_time_deltas = []
-    for name, files in node_included_files.items():
+    for name in node_names:
         feature = feature_dict[name]
-        orig_seq_len = len(files)
         feature = feature[-max_seq_len:, :]  # get last max_seq_len time steps
 
-        if time_deltas != None:
+        if time_deltas is not None:
             time_dt = time_deltas[name][-max_seq_len:]  # (max_seq_len,)
             assert len(time_dt) == feature.shape[0]
 
@@ -124,11 +174,11 @@ def get_feat_seq(
                     )
                 else:
                     padded = (
-                        np.ones((max_seq_len - feature.shape[0], feature.shape[1]))
-                        * padding_val
+                            np.ones((max_seq_len - feature.shape[0], feature.shape[1]))
+                            * padding_val
                     )
                 feature = np.concatenate([feature, padded], axis=0)
-                if time_deltas != None:
+                if time_deltas is not None:
                     padded_dt = np.zeros((max_seq_len - time_dt.shape[0]))
                     time_dt = np.concatenate([time_dt, padded_dt], axis=0)
             else:
@@ -141,26 +191,23 @@ def get_feat_seq(
                     )
                 else:
                     padded = (
-                        np.ones((max_seq_len - feature.shape[0], feature.shape[1]))
-                        * padding_val
+                            np.ones((max_seq_len - feature.shape[0], feature.shape[1]))
+                            * padding_val
                     )
                 feature = np.concatenate([padded, feature], axis=0)
-                if time_deltas != None:
+                if time_deltas is not None:
                     padded_dt = np.zeros((max_seq_len - time_dt.shape[0]))
                     time_dt = np.concatenate([padded_dt, time_dt], axis=0)
         padded_features.append(feature)
-        if time_deltas != None:
+        if time_deltas is not None:
             padded_time_deltas.append(time_dt)
-        seq_len = np.minimum(max_seq_len, orig_seq_len)
-        seq_lengths.append(seq_len)
 
     padded_features = np.stack(padded_features)
-    seq_lengths = np.stack(seq_lengths)
-    if time_deltas != None:
+    if time_deltas is not None:
         padded_time_deltas = np.expand_dims(np.stack(padded_time_deltas), axis=-1)
         padded_features = np.concatenate([padded_features, padded_time_deltas], axis=-1)
 
-    return padded_features, seq_lengths
+    return padded_features
 
 
 def get_img_features(feature_dir, node_included_files):
@@ -178,7 +225,7 @@ def get_img_features(feature_dir, node_included_files):
 
         for img_dir in files:
             with open(
-                os.path.join(feature_dir, img_dir.split("/")[-1] + ".pkl"), "rb"
+                    os.path.join(feature_dir, img_dir.split("/")[-1] + ".pkl"), "rb"
             ) as pf:
                 feature = pickle.load(pf)
             curr_feat.append(feature)
@@ -189,18 +236,18 @@ def get_img_features(feature_dir, node_included_files):
 
 
 def get_time_varying_edges(
-    node_included_files,
-    edge_dict,
-    edge_modality,
-    hospital_stay,
-    cpt_dict=None,
-    icd_dict=None,
-    lab_dict=None,
-    med_dict=None,
+        node_names,
+        edge_dict,
+        edge_modality,
+        hospital_stay,
+        cpt_dict=None,
+        icd_dict=None,
+        lab_dict=None,
+        med_dict=None,
 ):
     """
     Args:
-        node_included_files: dict, key is node name, value is list of image paths
+        node_names: list, with node names
         edge_dict: dict, key is node name, value is EHR features
         edge_modality: list of EHR sources for edges
         hospital_stay: numpy array, lengths of hospital stays, shape (sample_size,)
@@ -214,7 +261,7 @@ def get_time_varying_edges(
     if edge_dict is None:
         edge_dict = {}
 
-    for i, name in enumerate(list(node_included_files.keys())):
+    for i, name in enumerate(node_names):
         if name not in edge_dict:
             edge_dict[name] = []
         # for cpt or icd or med, we sum over all days & average by length of stay (in days)
@@ -252,10 +299,9 @@ def get_time_varying_edges(
 
 
 def compute_edges(
-    dist_dict,
-    node_names,
-    top_perc=0.01,
-    gauss_kernel=True,
+        dist_dict,
+        top_perc=0.1,
+        gauss_kernel=True,
 ):
     """
     Computes edge weights
@@ -267,22 +313,14 @@ def compute_edges(
     Returns:
         edges: numpy array of edge weights, shape (num_edges,)
     """
-    if "CosineSim" in dist_dict:
-        cos_sim = np.array(dist_dict["CosineSim"])
-        dist = 1 - cos_sim
-    else:
-        cos_sim = None
-        dist = np.array(dist_dict["Distance"])
+    src_nodes, dst_nodes, dist = dist_dict.values()
 
     # sanity check shape, (num_nodes) * (num_nodes + 1) / 2, if consider self-edges
-    assert len(dist) == (len(node_names) * (len(node_names) + 1) / 2)
+    # assert len(dist) == (len(node_names) * (len(node_names) + 1) / 2)
 
     # apply gaussian kernel, use cosine distance instead of cosine similarity
-    if gauss_kernel or (cos_sim is None):
-        std = dist.std()
-        edges = np.exp(-np.square(dist / std))
-    else:
-        edges = cos_sim
+    std = dist.std()
+    edges = np.exp(-np.square(dist / std))
 
     # mask the edges
     if top_perc is not None:
@@ -290,14 +328,15 @@ def compute_edges(
         num_to_keep = int(num * top_perc)
         sorted_dist = np.sort(edges)[::-1]  # descending order
         thresh = sorted_dist[:num_to_keep][-1]
-        mask = edges >= thresh
-        mask[edges < 0] = 0  # no edge for negative "distance"
-        edges = edges * mask
+        mask = edges >= thresh & (edges > 0)
+        edges = edges[mask]
+        src_nodes = src_nodes[mask]
+        dst_nodes = dst_nodes[mask]
 
-    return edges
+    return src_nodes, dst_nodes, edges
 
 
-def get_readmission_label_mimic(df_demo, max_seq_len=None):
+def get_readmission_label_mimic(df_demo):
     """
     Args:
         df_demo: dataframe with patient readmission info and demographics:
@@ -311,91 +350,14 @@ def get_readmission_label_mimic(df_demo, max_seq_len=None):
         total_stay: dict, key is node name, value is total length of stay (in days)
         time_idxs: dict, key is node name, value is the index of each cxr in terms of the day within hospitalization
     """
-    labels = []
-    node_included_files = {}
-    label_splits = []
-    time_deltas = {}
-    total_stay = {}
-    time_idxs = {}
-
-    for _, row in tqdm(df_demo.iterrows(), total=len(df_demo)):
-        pat = row["subject_id"]
-        admit_dt = row["admittime"]
-        discharge_dt = row["dischtime"]
-        admit_id = row["hadm_id"]
-        split = row["splits"]
-
-        curr_name = str(pat) + "_" + str(admit_id)
-        if curr_name not in node_included_files:
-            node_included_files[curr_name] = []
-        else:
-            continue
-
-        label_splits.append(split)
-
-        # label
-        if str(row["readmitted_within_30days"]).lower() == "true":
-            labels.append(1)
-        else:
-            labels.append(0)
-
-        admit_df = df_demo[df_demo["hadm_id"] == admit_id]
-
-        # sort by study datetime
-        admit_df = admit_df.sort_values(
-            by=["StudyDate", "StudyTime"], ascending=[True, True]
-        )
-
-        # get list of cxrs sorted by study datetime
-        for _, admit_row in admit_df.iterrows():
-            node_included_files[curr_name].append(admit_row["image_path"])
-
-        # get last max_seq_len cxrs if max_seq_len is specified
-        if max_seq_len is not None:
-            node_included_files[curr_name] = node_included_files[curr_name][
-                -max_seq_len:
-            ]
-
-        # time delta & total hospital stay
-        curr_timedelta = np.zeros((len(node_included_files[curr_name])))
-
-        prev_date = pd.to_datetime(admit_dt)
-        addmission_date = pd.to_datetime(admit_dt)
-        discharge_date = pd.to_datetime(discharge_dt)
-
-        hospital_stay = (
-            discharge_date.date() - pd.to_datetime(addmission_date).date()
-        ).days + 1  # in days
-        curr_timeidxs = []
-        for t, fn in enumerate(node_included_files[curr_name]):
-            study_date = pd.to_datetime(
-                df_demo[df_demo["image_path"] == fn]["StudyDate"].values[0],
-                format="%Y%m%d",
-            )
-            if t > 0:  # first time delta is always 0
-                curr_timedelta[t] = (
-                    study_date.date() - prev_date.date()
-                ).days  # in days
-                prev_date = study_date
-
-            time_index = (
-                study_date.date() - pd.to_datetime(addmission_date).date()
-            ).days  # index starts from 0
-            curr_timeidxs.append(time_index)
-
-        assert hospital_stay != np.nan
-        assert len(curr_timeidxs) > 0  # because at least one cxr
-        total_stay[curr_name] = hospital_stay
-        time_idxs[curr_name] = curr_timeidxs
-
-        # normalize by hospital stay
-        time_deltas[curr_name] = curr_timedelta / hospital_stay
+    labels = df_demo.readmitted
+    node_names = (df_demo.subject_id.astype(str) + "_" + df_demo.hadm_id.astype(str)).tolist()
+    label_splits = df_demo.splits.values
+    total_stay = dict(zip(node_names, df_demo.readmission_gap_in_days))
 
     return (
-        np.array(labels),
-        node_included_files,
+        np.asarray(labels),
+        node_names,
         label_splits,
-        time_deltas,
         total_stay,
-        time_idxs,
     )
