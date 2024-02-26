@@ -45,7 +45,7 @@ def date_ranges_to_days(row):
 
 
 def main(args):
-    pandarallel.initialize(progress_bar=True, nb_workers=20)
+    pandarallel.initialize(progress_bar=True, nb_workers=10)
     # read csv files
     demo_file = os.path.join(args.cohort_dir, "mimic_admission_demo.csv")
     df_demo = pd.read_csv(demo_file, low_memory=False, parse_dates=["admittime", "dischtime"])

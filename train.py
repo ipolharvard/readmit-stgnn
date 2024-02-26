@@ -1,18 +1,37 @@
 import json
 import os
-import pickle
 from json import dumps
 
 import dgl
 import torch
 import torch.nn as nn
+from sklearn.metrics import roc_auc_score
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm
 
 import utils
 from args import get_args
 from data.dataset import ReadmissionDataset
 from model.model import GraphRNN, GConvLayers
+from model.simple_lstm import SimpleLSTM
 from model.simple_rnn import SimpleRNN
+
+
+def auc_ci(y_true, y_pred, num_bootstraps=1000, ci=95):
+    bootstrap_means = torch.empty(num_bootstraps)
+
+    for i in range(num_bootstraps):
+        indices = torch.randint(0, len(y_pred), (len(y_pred),))
+        bootstrap_means[i] = roc_auc_score(y_true[indices], y_pred[indices])
+
+    lower_percentile = (100 - ci) / 2
+    upper_percentile = 100 - lower_percentile
+
+    lower_bound = bootstrap_means.quantile(lower_percentile / 100)
+    upper_bound = bootstrap_means.quantile(upper_percentile / 100)
+
+    return lower_bound.item(), upper_bound.item()
 
 
 def evaluate(
@@ -26,53 +45,43 @@ def evaluate(
         best_thresh=0.5,
         save_file=None,
         thresh_search=False,
-        img_features=None,
-        ehr_features=None,
+        device="cpu",
+        evaluate_ci=False,
 ):
     model.eval()
     with torch.no_grad():
-        if "fusion" in args.model_name:
-            logits = model(graph, img_features, ehr_features)
-        elif args.model_name != "stgnn":
-            assert len(graph) == 1
-            features_avg = features[:, -1, :]
-            logits, _ = model(graph[0], features_avg)
-        else:
-            logits, _ = model(graph, features)
-        logits = logits[nid]
+        dataset = TensorDataset(features[nid], labels[nid])
+        dataloader = DataLoader(dataset, batch_size=2048, shuffle=False)
+        preds, losses = [], []
+        for inputs, targets in dataloader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            logits = model(inputs).squeeze()
+            loss = loss_fn(logits, targets)
 
-        if logits.shape[-1] == 1:
-            logits = logits.view(-1)  # (batch_size,)
+            losses.append(loss.item())
+            preds.append(logits.cpu())
 
-        labels = labels[nid]
-        loss = loss_fn(logits, labels)
+        loss = torch.tensor(losses).mean()
 
-        logits = logits.view(-1)  # (batch_size,)
-        probs = torch.sigmoid(logits).cpu().numpy()  # (batch_size, )
-        preds = (probs >= best_thresh).astype(int)  # (batch_size, )
+        logits = torch.cat(preds, dim=0)
+        probs = torch.sigmoid(logits)
+
+        preds = (probs >= best_thresh).int().numpy()
 
         eval_results = utils.eval_dict(
-            y=labels.data.cpu().numpy(),
+            y=labels[nid].numpy(),
             y_pred=preds,
-            y_prob=probs,
+            y_prob=probs.numpy(),
             average="binary",
             thresh_search=thresh_search,
             best_thresh=best_thresh,
         )
         eval_results["loss"] = loss.item()
 
-    if save_file is not None:
-        with open(save_file, "wb") as pf:
-            pickle.dump(
-                {
-                    "probs": probs,
-                    "labels": labels.cpu().numpy(),
-                    "preds": preds,
-                    "node_indices": nid,
-                },
-                pf,
-            )
-
+        if evaluate_ci:
+            lower_bound, upper_bound = auc_ci(labels[nid], probs, num_bootstraps=1000)
+            eval_results["ci_lower"] = lower_bound
+            eval_results["ci_upper"] = upper_bound
     return eval_results
 
 
@@ -108,14 +117,14 @@ def main(args):
         max_seq_len_ehr=args.max_seq_len_ehr,
         standardize=True,
         ehr_types=args.ehr_types,
-        is_graph=args.model_name != "rnn",
+        is_graph=False,
     )
     g = dataset[0]
     cat_idxs = dataset.cat_idxs
     cat_dims = dataset.cat_dims
 
     features = g.ndata["feat"]
-    labels = g.ndata["label"]
+    labels = g.ndata["label"].float()
     train_mask = g.ndata["train_mask"]
     val_mask = g.ndata["val_mask"]
     test_mask = g.ndata["test_mask"]
@@ -137,29 +146,25 @@ def main(args):
         )
     )
 
-    train_nid = torch.nonzero(train_mask).squeeze().to(device)
-    val_nid = torch.nonzero(val_mask).squeeze().to(device)
-    test_nid = torch.nonzero(test_mask).squeeze().to(device)
+    train_nid = torch.nonzero(train_mask).squeeze()
+    val_nid = torch.nonzero(val_mask).squeeze()
+    test_nid = torch.nonzero(test_mask).squeeze()
 
     logger.info(
         "#Train samples: {:,}; positive percentage: {:.2%}".format(
-            train_mask.sum(), labels[train_mask].float().mean()
+            train_mask.sum(), labels[train_mask].mean()
         )
     )
     logger.info(
         "#Val samples: {:,}; positive percentage: {:.2%}".format(
-            val_mask.sum(), labels[val_mask].float().mean()
+            val_mask.sum(), labels[val_mask].mean()
         )
     )
     logger.info(
         "#Test samples: {:,}; positive percentage: {:.2%}".format(
-            test_mask.sum(), labels[test_mask].float().mean(),
+            test_mask.sum(), labels[test_mask].mean(),
         )
     )
-
-    features = features.to(device)
-    labels = labels.to(device).float()
-    g = g.int().to(device)
 
     if args.model_name == "stgnn":
         in_dim = features.shape[-1]
@@ -184,9 +189,19 @@ def main(args):
             input_size=in_dim,
             hidden_size=args.hidden_dim,
             output_size=1,
-            num_layers=args.num_rnn_layers
+            num_layers=args.num_rnn_layers,
+            dropout=args.dropout,
         )
-
+    elif args.model_name == "lstm":
+        in_dim = features.shape[-1]
+        print("Input dim:", in_dim)
+        model = SimpleLSTM(
+            input_size=in_dim,
+            hidden_size=args.hidden_dim,
+            output_size=1,
+            num_layers=args.num_rnn_layers,
+            dropout=args.dropout,
+        )
     else:
         in_dim = features.shape[-1]
         print("Input dim:", in_dim)
@@ -248,18 +263,18 @@ def main(args):
 
             epoch += 1
             logger.info("Starting epoch {}...".format(epoch))
+            train_loss = []
 
-            if args.model_name == "rnn":
-                logits = model(features)
-            else:
-                logits, _ = model(g, features)
-
-            logits = logits.squeeze()
-            loss = loss_fn(logits[train_nid], labels[train_nid])
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            dataset = TensorDataset(features[train_nid], labels[train_nid])
+            dataloader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
+            for inputs, targets in tqdm(dataloader):
+                optimizer.zero_grad()
+                inputs, targets = inputs.to(device), targets.to(device)
+                logits = model(inputs).squeeze()
+                loss = loss_fn(logits, targets)
+                train_loss.append(loss.item())
+                loss.backward()
+                optimizer.step()
 
             # evaluate on val set
             if epoch % args.eval_every == 0:
@@ -272,6 +287,7 @@ def main(args):
                     labels=labels,
                     nid=val_nid,
                     loss_fn=loss_fn,
+                    device=device,
                 )
                 model.train()
                 saver.save(epoch, model, optimizer, eval_results[args.metric_name])
@@ -287,8 +303,11 @@ def main(args):
                     early_stop = True
 
                 # Log to console
+
+                logger.info("TRAIN - Epoch: {} | Loss: {:.4f}".format(epoch, sum(train_loss) / len(
+                    train_loss)))
                 results_str = ", ".join(
-                    "{}: {:.4f}".format(k, v) for k, v in eval_results.items()
+                    "{}: {:.3f}".format(k, eval_results[k]) for k in ["auroc", "loss"]
                 )
                 logger.info("VAL - {}".format(results_str))
 
@@ -311,9 +330,10 @@ def main(args):
         loss_fn=loss_fn,
         save_file=os.path.join(args.save_dir, "val_predictions.pkl"),
         thresh_search=args.thresh_search,
+        device=device,
     )
     val_results_str = ", ".join(
-        "{}: {:.4f}".format(k, v) for k, v in val_results.items()
+        "{}: {:.3f}".format(k, v) for k, v in val_results.items()
     )
     logger.info("VAL - {}".format(val_results_str))
 
@@ -328,9 +348,11 @@ def main(args):
         loss_fn=loss_fn,
         save_file=os.path.join(args.save_dir, "test_predictions.pkl"),
         best_thresh=val_results["best_thresh"],
+        device=device,
+        evaluate_ci=True
     )
     test_results_str = ", ".join(
-        "{}: {:.4f}".format(k, v) for k, v in test_results.items()
+        "{}: {:.3f}".format(k, v) for k, v in test_results.items()
     )
     logger.info("TEST - {}".format(test_results_str))
 

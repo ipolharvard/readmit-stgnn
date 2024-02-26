@@ -327,7 +327,7 @@ class ReadmissionDataset(DGLDataset):
 
         # get patients
         self.df_all = pd.read_csv(demo_file)
-        # self.df_all = self.df_all.loc[self.df_all.splits != "test"]
+        # use only these admissions where patient was discharged
         self.df_all = self.df_all.loc[lambda _df: ~_df.died]
 
         super().__init__(name="readmission")

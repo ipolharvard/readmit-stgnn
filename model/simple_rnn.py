@@ -1,21 +1,21 @@
-import torch
 import torch.nn as nn
 
 
 class SimpleRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0.0):
         super(SimpleRNN, self).__init__()
-        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.rnn = nn.RNN(input_size=input_size,
+                          hidden_size=hidden_size,
+                          num_layers=num_layers,
+                          dropout=dropout,
+                          batch_first=True)
+
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
-        # Initialize hidden state with zeros
-        # Shape: (num_layers, batch_size, hidden_size)
-        h0 = torch.zeros(self.rnn.num_layers, x.size(0), self.rnn.hidden_size).to(x.device)
-
-        # Forward propagate RNN
-        out, _ = self.rnn(x, h0)
-
-        # Take the last sequence step only for classification
-        out = self.fc(out[:, -1, :])
+        output, hidden = self.rnn(x)  # output shape: (batch, seq_len, hidden_size)
+        last_output = output[:, -1, :]
+        out = self.fc(last_output)
         return out
