@@ -2,33 +2,29 @@
 Adapted from DGL implementation of GNN Explainer: https://github.com/dmlc/dgl/blob/master/examples/pytorch/gnn_explainer
 """
 
-import numpy as np
-import dgl
-import sys
+import argparse
+import copy
+import json
+import math
 import os
-import torch
-import torch.nn as nn
 import pickle
+
+import dgl
+import numpy as np
+import torch
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from model.model import GraphRNN
-from model.fusion import JointFusionModel
-from data.dataset import ReadmissionDataset
-from utils import get_config
-import copy
-from tqdm import tqdm
-from sklearn.metrics import roc_curve
-import torch as th
-import dgl
-from dgl.data.utils import load_graphs
 from dgl.sampling import sample_neighbors
 from dotted_dict import DottedDict
-import json
-import pandas as pd
-import argparse
+from sklearn.metrics import roc_curve
+from tqdm import tqdm
+
 import utils
+from data.dataset import ReadmissionDataset
+from model.fusion import JointFusionModel
+from model.model import GraphRNN
+from utils import get_config
 
 
 def extract_subgraph(graph, seed_nodes, hops=2):

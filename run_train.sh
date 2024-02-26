@@ -1,12 +1,12 @@
 #!/bin/bash
 
-python train.py \
-    --save_dir data/ckp \
-    --demo_file data/mimic_processed/mimic_admission_demo.csv \
+python stgnn/train.py \
+    --save_dir stgnn/data/ckp \
+    --demo_file stgnn/data/mimic_processed/mimic_admission_demo.csv \
     --edge_modality 'demo' \
     --feature_type 'non-imaging' \
-    --ehr_feature_file data/mimic_processed/ehr_preprocessed_seq_by_day.pkl \
-    --edge_ehr_file data/mimic_processed/ehr_preprocessed_seq_by_day.pkl \
+    --ehr_feature_file stgnn/data/mimic_processed/ehr_preprocessed_seq_by_day.pkl \
+    --edge_ehr_file stgnn/data/mimic_processed/ehr_preprocessed_seq_by_day.pkl \
     --ehr_types 'demo' 'icd' 'lab' 'med' \
     --edge_top_perc 0.1 \
     --max_seq_len_ehr 9 \

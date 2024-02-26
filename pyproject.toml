@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stgnn"
+version = "0.1.0"
+description = "Multimodal spatiotemporal graph neural networks for improved prediction of 30-day all-cause hospital readmission"
+readme = "README.md"
+dependencies = [
+    'importlib-metadata; python_version>="3.8"',
+    "pandas",
+    "torch",
+    "dgl",
+    "tqdm",
+    "dotted-dict",
+    "scikit-learn",
+    "scipy",
+    "sortedcontainers",
+    "pandarallel"
+]
+
+[tool.setuptools]
+packages = ["stgnn"]

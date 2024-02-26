@@ -1,10 +1,14 @@
+import pickle
+
 import dgl
-import torch
+import numpy as np
 import pandas as pd
+import torch
 from dgl.data import DGLDataset
 from sklearn.preprocessing import StandardScaler
 
-from data.readmission_utils import *
+from .readmission_utils import get_readmission_label_mimic, get_feat_seq, \
+    get_time_varying_edges, compute_dist_mat, compute_edges
 
 
 def construct_graph_readmission(
@@ -24,13 +28,15 @@ def construct_graph_readmission(
     Args:
         df_demo: dataframe of cohort with demographic and imaging information
         ehr_feature_file: file of preprocessed EHR feature
-        edge_ehr_file: file of preprocesdded EHR feature for edges
+        edge_ehr_file: file of preprocessed EHR feature for edges
         edge_modality: list of EHR sources for edge
         top_perc: top percentage edges to be kept for graph
         gauss_kernel: whether to use Gaussian kernel for edge weights
         standardize: whether to standardize node features
         max_seq_len_ehr: maximum sequence length of EHR features
         ehr_types: list of EHR sources for node features
+        is_graph: whether to construct graph, we dont use it because the graph does not work with
+        our cohort
     Returns:
         node2idx: dict, key is node name, value is node index
         dgl_G: dgl graph
@@ -129,8 +135,6 @@ def construct_graph_readmission(
         dummy_graph.ndata["feat"] = torch.from_numpy(node_features)
         return node2idx, dummy_graph, labels, splits
 
-    # edges
-    node_edge_dict = {}
     if (
             ("demo" in edge_modality)
             or ("cpt" in edge_modality)
